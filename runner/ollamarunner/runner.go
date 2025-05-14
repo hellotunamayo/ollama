@@ -303,33 +303,79 @@ func (s *Server) allNil() bool {
 }
 
 func flushPending(seq *Sequence) bool {
-	pending := seq.pendingResponses
-	seq.pendingResponses = []llm.CompletionResponse{}
+	if len(seq.pendingResponses) == 0 {
+		return true
+	}
 
-	// Check if there are any partial UTF-8 characters remaining.
-	// We already check and queue as we are generating but some may
-	// still make it here:
-	// - Sequence is ending, e.g. generation limit has been hit
-	// - Invalid characters in the middle of a string
-	// This is a stricter check to ensure we never output invalid Unicode.
-	for i, r := range pending {
-		if i == len(pending)-1 {
-			// Check and trim any trailing partial UTF-8 characters
-			content := r.Content
-			for !utf8.ValidString(content) {
-				content = content[:len(content)-1]
-			}
-			r.Content = content
-		}
-
-		select {
-		case seq.responses <- r:
-			return true
-		case <-seq.quit:
-			return false
+	// We need to find if any response has Done=true
+	hasDoneResponse := false
+	doneIndex := -1
+	for i, resp := range seq.pendingResponses {
+		if resp.Done {
+			hasDoneResponse = true
+			doneIndex = i
+			break
 		}
 	}
-	// no pending responses to send
+
+	// Handle responses one by one
+	var pendingUTF8 string // Buffer for incomplete UTF-8 sequences
+
+	for i, resp := range seq.pendingResponses {
+		currentResp := resp
+
+		// Combine any pending UTF-8 with current content
+		combinedContent := pendingUTF8 + currentResp.Content
+		pendingUTF8 = ""
+
+		// If this content is valid UTF-8, send it
+		if utf8.ValidString(combinedContent) {
+			currentResp.Content = combinedContent
+		} else {
+			// Content has invalid UTF-8
+			// If this is the last response or the response with Done=true, trim it
+			if i == len(seq.pendingResponses)-1 || (hasDoneResponse && i == doneIndex) {
+				// Trim incomplete UTF-8 characters
+				trimmedContent := combinedContent
+				for !utf8.ValidString(trimmedContent) && len(trimmedContent) > 0 {
+					trimmedContent = trimmedContent[:len(trimmedContent)-1]
+				}
+				currentResp.Content = trimmedContent
+			} else {
+				// Not the last response or Done response - keep incomplete UTF-8 for the next response
+				// Determine valid and invalid parts
+				validPrefix := combinedContent
+				for !utf8.ValidString(validPrefix) && len(validPrefix) > 0 {
+					validPrefix = validPrefix[:len(validPrefix)-1]
+				}
+
+				// If we have a valid prefix, send it
+				if len(validPrefix) > 0 {
+					currentResp.Content = validPrefix
+					// The remainder becomes pending UTF-8
+					pendingUTF8 = combinedContent[len(validPrefix):]
+				} else {
+					// No valid prefix, all content is invalid UTF-8
+					pendingUTF8 = combinedContent
+					// Skip sending this response
+					continue
+				}
+			}
+		}
+
+		// Send the response if it has content or if it's the final response with Done=true
+		if len(currentResp.Content) > 0 || (currentResp.Done) {
+			select {
+			case seq.responses <- currentResp:
+				// Successfully sent
+			case <-seq.quit:
+				return false
+			}
+		}
+	}
+
+	// Clear pending responses
+	seq.pendingResponses = []llm.CompletionResponse{}
 	return true
 }
 
