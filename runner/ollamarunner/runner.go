@@ -328,7 +328,12 @@ func flushPending(seq *Sequence) bool {
 		combinedContent := pendingUTF8 + currentResp.Content
 		pendingUTF8 = ""
 
-		// If this content is valid UTF-8, send it
+		// Check if there are any partial UTF-8 characters remaining.
+		// We already check and queue as we are generating but some may
+		// still make it here:
+		// - Sequence is ending, e.g. generation limit has been hit
+		// - Invalid characters in the middle of a string
+		// This is a stricter check to ensure we never output invalid Unicode.
 		if utf8.ValidString(combinedContent) {
 			currentResp.Content = combinedContent
 		} else {
