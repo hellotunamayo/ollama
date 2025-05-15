@@ -18,7 +18,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"golang.org/x/sync/semaphore"
 
@@ -86,6 +85,29 @@ type Sequence struct {
 	startGenerationTime time.Time
 	numPredicted        int
 	numPromptInputs     int
+}
+
+var _ common.ResponseSequence = (*Sequence)(nil)
+
+func (seq *Sequence) Pending() []llm.CompletionResponse {
+	return seq.pendingResponses
+}
+
+func (seq *Sequence) Clear() {
+	seq.pendingResponses = []llm.CompletionResponse{}
+}
+
+func (seq *Sequence) Send(resp llm.CompletionResponse) bool {
+	if len(resp.Content) > 0 || resp.Done {
+		select {
+		case seq.responses <- resp:
+			// Successfully sent
+			return true
+		case <-seq.quit:
+			return false
+		}
+	}
+	return true
 }
 
 type NewSequenceParams struct {
@@ -302,92 +324,10 @@ func (s *Server) allNil() bool {
 	return true
 }
 
-func flushPending(seq *Sequence) bool {
-	if len(seq.pendingResponses) == 0 {
-		return true
-	}
-
-	// We need to find if any response has Done=true
-	hasDoneResponse := false
-	doneIndex := -1
-	for i, resp := range seq.pendingResponses {
-		if resp.Done {
-			hasDoneResponse = true
-			doneIndex = i
-			break
-		}
-	}
-
-	// Handle responses one by one
-	var pendingUTF8 string // Buffer for incomplete UTF-8 sequences
-
-	for i, resp := range seq.pendingResponses {
-		currentResp := resp
-
-		// Combine any pending UTF-8 with current content
-		combinedContent := pendingUTF8 + currentResp.Content
-		pendingUTF8 = ""
-
-		// Check if there are any partial UTF-8 characters remaining.
-		// We already check and queue as we are generating but some may
-		// still make it here:
-		// - Sequence is ending, e.g. generation limit has been hit
-		// - Invalid characters in the middle of a string
-		// This is a stricter check to ensure we never output invalid Unicode.
-		if utf8.ValidString(combinedContent) {
-			currentResp.Content = combinedContent
-		} else {
-			// Content has invalid UTF-8
-			// If this is the last response or the response with Done=true, trim it
-			if i == len(seq.pendingResponses)-1 || (hasDoneResponse && i == doneIndex) {
-				// Trim incomplete UTF-8 characters
-				trimmedContent := combinedContent
-				for !utf8.ValidString(trimmedContent) && len(trimmedContent) > 0 {
-					trimmedContent = trimmedContent[:len(trimmedContent)-1]
-				}
-				currentResp.Content = trimmedContent
-			} else {
-				// Not the last response or Done response - keep incomplete UTF-8 for the next response
-				// Determine valid and invalid parts
-				validPrefix := combinedContent
-				for !utf8.ValidString(validPrefix) && len(validPrefix) > 0 {
-					validPrefix = validPrefix[:len(validPrefix)-1]
-				}
-
-				// If we have a valid prefix, send it
-				if len(validPrefix) > 0 {
-					currentResp.Content = validPrefix
-					// The remainder becomes pending UTF-8
-					pendingUTF8 = combinedContent[len(validPrefix):]
-				} else {
-					// No valid prefix, all content is invalid UTF-8
-					pendingUTF8 = combinedContent
-					// Skip sending this response
-					continue
-				}
-			}
-		}
-
-		// Send the response if it has content or if it's the final response with Done=true
-		if len(currentResp.Content) > 0 || (currentResp.Done) {
-			select {
-			case seq.responses <- currentResp:
-				// Successfully sent
-			case <-seq.quit:
-				return false
-			}
-		}
-	}
-
-	// Clear pending responses
-	seq.pendingResponses = []llm.CompletionResponse{}
-	return true
-}
-
 func (s *Server) removeSequence(seqIndex int, reason llm.DoneReason) {
 	seq := s.seqs[seqIndex]
 
-	flushPending(seq)
+	common.FlushPending(seq)
 	seq.doneReason = reason
 	close(seq.responses)
 	close(seq.embedding)
@@ -622,7 +562,7 @@ func (s *Server) processBatch() error {
 			continue
 		}
 
-		if !flushPending(seq) {
+		if !common.FlushPending(seq) {
 			s.removeSequence(i, llm.DoneReasonConnectionClosed)
 		}
 	}

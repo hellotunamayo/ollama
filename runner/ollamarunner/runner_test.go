@@ -8,6 +8,7 @@ import (
 	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/model"
 	"github.com/ollama/ollama/model/input"
+	"github.com/ollama/ollama/runner/common"
 )
 
 // testBackend implements ml.Backend with minimal functionality required for tests.
@@ -45,6 +46,7 @@ func (c *testContext) FromFloatSlice(s []float32, shape ...int) (ml.Tensor, erro
 	copy(t.data, s)
 	return t, nil
 }
+
 func (c *testContext) FromIntSlice(s []int32, shape ...int) (ml.Tensor, error) {
 	f := make([]float32, len(s))
 	for i, v := range s {
@@ -54,6 +56,7 @@ func (c *testContext) FromIntSlice(s []int32, shape ...int) (ml.Tensor, error) {
 	out.(*testTensor).dtype = ml.DTypeI32
 	return out, nil
 }
+
 func (c *testContext) Arange(start, stop, step float32, dtype ml.DType) ml.Tensor {
 	return c.Empty(dtype, int((stop-start)/step))
 }
@@ -95,9 +98,11 @@ func (t *testTensor) Softmax(ctx ml.Context) ml.Tensor                      { re
 func (t *testTensor) LayerNorm(ctx ml.Context, w, b ml.Tensor, e float32) ml.Tensor {
 	return nil
 }
+
 func (t *testTensor) View(ctx ml.Context, offset int, shape ...int) ml.Tensor {
 	return ctx.(*testContext).Empty(t.dtype, shape...)
 }
+
 func (t *testTensor) Copy(ctx ml.Context, dest ml.Tensor) ml.Tensor {
 	copy(dest.(*testTensor).data, t.data)
 	return nil
@@ -139,8 +144,10 @@ func (f *testModel) Decode(ids []int32) (string, error) {
 func (f *testModel) Is(id int32, sp model.Special) bool { return false }
 func (f *testModel) Vocabulary() *model.Vocabulary      { return &model.Vocabulary{} }
 
-var _ model.Model = (*testModel)(nil)
-var _ model.TextProcessor = (*testModel)(nil)
+var (
+	_ model.Model         = (*testModel)(nil)
+	_ model.TextProcessor = (*testModel)(nil)
+)
 
 func TestFlushPending(t *testing.T) {
 	tests := []struct {
@@ -236,8 +243,7 @@ func TestFlushPending(t *testing.T) {
 				quit:             make(chan bool, 1),
 			}
 
-			// Call flushPending
-			result := flushPending(seq)
+			result := common.FlushPending(seq)
 
 			// Verify that flushPending returned true (success)
 			if !result {
