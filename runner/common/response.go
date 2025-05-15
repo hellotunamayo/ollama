@@ -85,11 +85,8 @@ func FlushPending(seq ResponseSequence) bool {
 			}
 		}
 
-		// Send the response if it has content or if it's the final response with Done=true
-		if len(currentResp.Content) > 0 || (currentResp.Done) {
-			if !seq.Send(currentResp) {
-				return false
-			}
+		if !seq.Send(currentResp) {
+			return false
 		}
 	}
 
