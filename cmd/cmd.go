@@ -39,12 +39,30 @@ import (
 	"github.com/ollama/ollama/format"
 	"github.com/ollama/ollama/parser"
 	"github.com/ollama/ollama/progress"
+	"github.com/ollama/ollama/readline"
 	"github.com/ollama/ollama/runner"
 	"github.com/ollama/ollama/server"
 	"github.com/ollama/ollama/types/model"
 	"github.com/ollama/ollama/types/syncmap"
 	"github.com/ollama/ollama/version"
 )
+
+// ensureThinkingSupport emits a warning if the model does not advertise thinking support
+func ensureThinkingSupport(ctx context.Context, client *api.Client, name string) {
+	if name == "" {
+		return
+	}
+	resp, err := client.Show(ctx, &api.ShowRequest{Model: name})
+	if err != nil {
+		return
+	}
+	for _, cap := range resp.Capabilities {
+		if cap == model.CapabilityThinking {
+			return
+		}
+	}
+	fmt.Fprintf(os.Stderr, "warning: model %q does not support thinking output\n", name)
+}
 
 var errModelfileNotFound = errors.New("specified Modelfile wasn't found")
 
@@ -262,9 +280,18 @@ func loadOrUnloadModel(cmd *cobra.Command, opts *runOptions) error {
 		return err
 	}
 
+	think := opts.Think
+	if think == nil {
+		falseVal := false
+		think = &falseVal
+	}
+
 	req := &api.GenerateRequest{
 		Model:     opts.Model,
 		KeepAlive: opts.KeepAlive,
+
+		// pass Think here so we fail before getting to the chat prompt if the model doesn't support it
+		Think: opts.Think,
 	}
 
 	return client.Generate(cmd.Context(), req, func(api.GenerateResponse) error { return nil })
@@ -298,6 +325,22 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	opts.Format = format
+
+	thinkFlag := cmd.Flags().Lookup("think")
+	if thinkFlag.Changed {
+		think, err := cmd.Flags().GetBool("think")
+		if err != nil {
+			return err
+		}
+		opts.Think = &think
+	} else {
+		opts.Think = nil
+	}
+	hidethinking, err := cmd.Flags().GetBool("hidethinking")
+	if err != nil {
+		return err
+	}
+	opts.HideThinking = hidethinking
 
 	keepAlive, err := cmd.Flags().GetString("keepalive")
 	if err != nil {
@@ -887,17 +930,19 @@ func PullHandler(cmd *cobra.Command, args []string) error {
 type generateContextKey string
 
 type runOptions struct {
-	Model       string
-	ParentModel string
-	Prompt      string
-	Messages    []api.Message
-	WordWrap    bool
-	Format      string
-	System      string
-	Images      []api.ImageData
-	Options     map[string]any
-	MultiModal  bool
-	KeepAlive   *api.Duration
+	Model        string
+	ParentModel  string
+	Prompt       string
+	Messages     []api.Message
+	WordWrap     bool
+	Format       string
+	System       string
+	Images       []api.ImageData
+	Options      map[string]any
+	MultiModal   bool
+	KeepAlive    *api.Duration
+	Think        *bool
+	HideThinking bool
 }
 
 type displayResponseState struct {
@@ -953,6 +998,14 @@ func displayResponse(content string, wordWrap bool, state *displayResponseState)
 	}
 }
 
+func thinkingOutputOpeningText() string {
+	return readline.ColorGrey + readline.ColorBold + "Thinking..." + readline.ColorDefault + readline.ColorGrey
+}
+
+func thinkingOutputClosingText() string {
+	return readline.ColorGrey + readline.ColorBold + "...done thinking." + readline.ColorDefault + "\n\n"
+}
+
 func chat(cmd *cobra.Command, opts runOptions) (*api.Message, error) {
 	client, err := api.ClientFromEnvironment()
 	if err != nil {
@@ -980,14 +1033,34 @@ func chat(cmd *cobra.Command, opts runOptions) (*api.Message, error) {
 	var latest api.ChatResponse
 	var fullResponse strings.Builder
 	var role string
+	var thinkTagOpened bool = false
+	var thinkTagClosed bool = false
 
 	fn := func(response api.ChatResponse) error {
-		p.StopAndClear()
+		if response.Message.Content != "" || !opts.HideThinking {
+			p.StopAndClear()
+		}
 
 		latest = response
 
 		role = response.Message.Role
+		if response.Message.Thinking != "" && !opts.HideThinking {
+			if !thinkTagOpened {
+				fmt.Print(thinkingOutputOpeningText())
+				thinkTagOpened = true
+			}
+			displayResponse(response.Message.Thinking, opts.WordWrap, state)
+		}
+
 		content := response.Message.Content
+		if thinkTagOpened && !thinkTagClosed && content != "" {
+			fmt.Print(thinkingOutputClosingText())
+			thinkTagClosed = true
+		}
+		// purposefully not putting thinking blocks in the response, which would
+		// only be needed if we later added tool calling to the cli (they get
+		// filtered out anyway since current models don't expect them unless you're
+		// about to finish some tool calls)
 		fullResponse.WriteString(content)
 
 		displayResponse(content, opts.WordWrap, state)
@@ -1004,6 +1077,11 @@ func chat(cmd *cobra.Command, opts runOptions) (*api.Message, error) {
 		Messages: opts.Messages,
 		Format:   json.RawMessage(opts.Format),
 		Options:  opts.Options,
+		Think:    opts.Think,
+	}
+
+	if opts.Think != nil {
+		ensureThinkingSupport(cmd.Context(), client, opts.Model)
 	}
 
 	if opts.KeepAlive != nil {
@@ -1065,12 +1143,29 @@ func generate(cmd *cobra.Command, opts runOptions) error {
 	}()
 
 	var state *displayResponseState = &displayResponseState{}
+	var thinkTagOpened bool = false
+	var thinkTagClosed bool = false
 
 	fn := func(response api.GenerateResponse) error {
-		p.StopAndClear()
-
 		latest = response
 		content := response.Response
+
+		if response.Response != "" || !opts.HideThinking {
+			p.StopAndClear()
+		}
+
+		if response.Thinking != "" && !opts.HideThinking {
+			if !thinkTagOpened {
+				fmt.Print(thinkingOutputOpeningText())
+				thinkTagOpened = true
+			}
+			displayResponse(response.Thinking, opts.WordWrap, state)
+		}
+
+		if thinkTagOpened && !thinkTagClosed && content != "" {
+			fmt.Print(thinkingOutputClosingText())
+			thinkTagClosed = true
+		}
 
 		displayResponse(content, opts.WordWrap, state)
 
@@ -1097,6 +1192,7 @@ func generate(cmd *cobra.Command, opts runOptions) error {
 		System:    opts.System,
 		Options:   opts.Options,
 		KeepAlive: opts.KeepAlive,
+		Think:     opts.Think,
 	}
 
 	if err := client.Generate(ctx, &request, fn); err != nil {
@@ -1312,6 +1408,8 @@ func NewCLI() *cobra.Command {
 	runCmd.Flags().Bool("insecure", false, "Use an insecure registry")
 	runCmd.Flags().Bool("nowordwrap", false, "Don't wrap words to the next line automatically")
 	runCmd.Flags().String("format", "", "Response format (e.g. json)")
+	runCmd.Flags().Bool("think", false, "Whether to use thinking mode for supported models")
+	runCmd.Flags().Bool("hidethinking", false, "Hide thinking output (if provided)")
 
 	stopCmd := &cobra.Command{
 		Use:     "stop MODEL",
@@ -1363,7 +1461,6 @@ func NewCLI() *cobra.Command {
 		PreRunE: checkServerHeartbeat,
 		RunE:    ListRunningHandler,
 	}
-
 	copyCmd := &cobra.Command{
 		Use:     "cp SOURCE DESTINATION",
 		Short:   "Copy a model",

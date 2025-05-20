@@ -3,6 +3,7 @@ package model
 import (
 	"cmp"
 	"context"
+	"fmt"
 	"iter"
 	"log/slog"
 	"slices"
@@ -89,6 +90,7 @@ func (v *Vocabulary) Decode(id int32) string {
 func (v *Vocabulary) SpecialVocabulary() []string {
 	v.specialOnce.Do(func() {
 		for i := range v.Values {
+			// if slices.Contains([]int{105, 106, 151668}, i) {
 			if slices.Contains([]int{105, 106}, i) {
 				v.special = append(v.special, v.Values[i])
 			} else if v.Types[i] == TOKEN_TYPE_CONTROL {
@@ -328,6 +330,14 @@ func (bpe BytePairEncoding) Encode(s string, addSpecial bool) ([]int32, error) {
 	return ids, nil
 }
 
+type lazyIdsString struct {
+	ids []int32
+}
+
+func (l lazyIdsString) LogValue() slog.Value {
+	return slog.AnyValue(fmt.Sprint(l.ids))
+}
+
 func (bpe BytePairEncoding) Decode(ids []int32) (string, error) {
 	var sb strings.Builder
 	for _, id := range ids {
@@ -352,6 +362,6 @@ func (bpe BytePairEncoding) Decode(ids []int32) (string, error) {
 		}
 	}
 
-	slog.Log(context.TODO(), logutil.LevelTrace, "decoded", "string", sb.String())
+	slog.Log(context.TODO(), logutil.LevelTrace, "decoded", "string", sb.String(), "from", lazyIdsString{ids: ids})
 	return sb.String(), nil
 }
